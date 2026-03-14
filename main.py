@@ -82,7 +82,13 @@ class ReceiptRequest(BaseModel):
     amount_paid: float
     transport_cost: Optional[float] = 0
     balance: Optional[float] = 0
-
+    
+class ClientPaymentRequest(BaseModel):
+    client_id: int
+    amount: float
+    payment_method: str
+    payment_date: str
+    notes: Optional[str] = None
 
 # ─────────────────────────────────────────────
 # SETUP — creates all tables and seeds password
@@ -118,6 +124,19 @@ def setup():
             FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
         )
     """)
+    
+    query("""
+    CREATE TABLE IF NOT EXISTS client_payments (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        client_id INT NOT NULL,
+        amount DECIMAL(10,2) NOT NULL,
+        payment_method VARCHAR(50),
+        payment_date DATE NOT NULL,
+        notes TEXT,
+        createdate DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (client_id) REFERENCES clients(id)
+    )
+""")
 
     query("""
         CREATE TABLE IF NOT EXISTS supplier_payments (
@@ -231,6 +250,31 @@ def login(body: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid password")
     return {"message": "Login successful"}
 
+@app.get("/client/{client_id}/payments", status_code=200)
+def get_client_payments(client_id: int):
+    return query(
+        "SELECT * FROM client_payments WHERE client_id = %s ORDER BY payment_date DESC",
+        (client_id,)
+    )
+
+@app.post("/client/payment", status_code=201)
+def add_client_payment(body: ClientPaymentRequest):
+    client = query("SELECT * FROM clients WHERE id = %s", (body.client_id,), fetchone=True)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    query(
+        "INSERT INTO client_payments (client_id, amount, payment_method, payment_date, notes) VALUES (%s, %s, %s, %s, %s)",
+        (body.client_id, body.amount, body.payment_method, body.payment_date, body.notes)
+    )
+    return {"message": "Payment recorded"}
+
+@app.delete("/client/payment/{payment_id}", status_code=200)
+def delete_client_payment(payment_id: int):
+    payment = query("SELECT * FROM client_payments WHERE id = %s", (payment_id,), fetchone=True)
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    query("DELETE FROM client_payments WHERE id = %s", (payment_id,))
+    return {"message": "Payment deleted"}
 
 @app.post("/resetPassword", status_code=200)
 def reset_password(body: ResetPasswordRequest):
@@ -267,6 +311,70 @@ def get_clients():
     """)
 
 
+# @app.get("/clients/{client_id}", status_code=200)
+# def get_client(client_id: int):
+#     client = query("SELECT * FROM clients WHERE id = %s", (client_id,), fetchone=True)
+#     if not client:
+#         raise HTTPException(status_code=404, detail="Client not found")
+
+#     orders = query("""
+#         SELECT o.*, r.receipt_number
+#         FROM orders o
+#         LEFT JOIN receipts r ON r.order_id = o.id
+#         WHERE o.client_id = %s
+#         ORDER BY o.order_date DESC
+#     """, (client_id,))
+
+#     stats = query("""
+#         SELECT
+#             COALESCE(SUM(total_weight_kg), 0) AS total_weight,
+#             COALESCE(SUM(total_weight_kg * price_per_kg), 0) AS total_revenue,
+#             COUNT(*) AS total_orders
+#         FROM orders WHERE client_id = %s
+#     """, (client_id,), fetchone=True)
+
+#     return { **client, "orders": orders, "stats": stats }
+
+# @app.get("/clients/{client_id}", status_code=200)
+# def get_client(client_id: int):
+#     client = query("SELECT * FROM clients WHERE id = %s", (client_id,), fetchone=True)
+#     if not client:
+#         raise HTTPException(status_code=404, detail="Client not found")
+
+#     orders = query("""
+#         SELECT o.*, r.receipt_number
+#         FROM orders o
+#         LEFT JOIN receipts r ON r.order_id = o.id
+#         WHERE o.client_id = %s
+#         ORDER BY o.order_date DESC
+#     """, (client_id,))
+
+#     stats = query("""
+#         SELECT
+#             COALESCE(SUM(total_weight_kg), 0) AS total_weight,
+#             COALESCE(SUM(total_weight_kg * price_per_kg), 0) AS total_revenue,
+#             COUNT(*) AS total_orders
+#         FROM orders WHERE client_id = %s
+#     """, (client_id,), fetchone=True)
+
+#     payments = query(
+#         "SELECT * FROM client_payments WHERE client_id = %s ORDER BY payment_date DESC",
+#         (client_id,)
+#     )
+
+#     total_paid = query(
+#         "SELECT COALESCE(SUM(amount), 0) AS total_paid FROM client_payments WHERE client_id = %s",
+#         (client_id,), fetchone=True
+#     )
+
+#     return {
+#         **client,
+#         "orders": orders,
+#         "stats": stats,
+#         "payments": payments,
+#         "total_paid": total_paid["total_paid"]
+#     }
+
 @app.get("/clients/{client_id}", status_code=200)
 def get_client(client_id: int):
     client = query("SELECT * FROM clients WHERE id = %s", (client_id,), fetchone=True)
@@ -274,7 +382,10 @@ def get_client(client_id: int):
         raise HTTPException(status_code=404, detail="Client not found")
 
     orders = query("""
-        SELECT o.*, r.receipt_number
+        SELECT o.*, r.receipt_number, r.amount_paid AS receipt_amount_paid,
+               r.transport_cost, r.balance AS receipt_balance,
+               r.payment_method AS receipt_payment_method,
+               r.createdate AS receipt_date
         FROM orders o
         LEFT JOIN receipts r ON r.order_id = o.id
         WHERE o.client_id = %s
@@ -289,9 +400,46 @@ def get_client(client_id: int):
         FROM orders WHERE client_id = %s
     """, (client_id,), fetchone=True)
 
-    return { **client, "orders": orders, "stats": stats }
+    # Payments from receipts (paid at point of receipt generation)
+    receipt_payments = query("""
+        SELECT
+            r.id,
+            r.amount_paid AS amount,
+            r.payment_method,
+            DATE(r.createdate) AS payment_date,
+            CONCAT('Receipt ', r.receipt_number) AS notes,
+            'receipt' AS source,
+            o.id AS order_id
+        FROM receipts r
+        JOIN orders o ON o.id = r.order_id
+        WHERE o.client_id = %s AND r.amount_paid > 0
+    """, (client_id,))
 
+    # Manual payments recorded separately
+    manual_payments = query("""
+        SELECT id, amount, payment_method, payment_date, notes,
+               'manual' AS source, NULL AS order_id
+        FROM client_payments
+        WHERE client_id = %s
+    """, (client_id,))
 
+    # Merge and sort all payments by date newest first
+    all_payments = sorted(
+        list(receipt_payments) + list(manual_payments),
+        key=lambda x: str(x.get("payment_date") or ""),
+        reverse=True
+    )
+
+    total_paid = sum(float(p["amount"] or 0) for p in all_payments)
+
+    return {
+        **client,
+        "orders": orders,
+        "stats": stats,
+        "payments": all_payments,
+        "total_paid": total_paid,
+    }
+    
 @app.post("/client", status_code=201)
 async def create_client(
     name: str = Form(...),
@@ -654,15 +802,23 @@ def create_receipt(body: ReceiptRequest):
 @app.get("/suppliers", status_code=200)
 def get_suppliers():
     return query("""
-        SELECT s.*,
-            COALESCE(SUM(sp.total_cost), 0) AS total_purchased,
-            COALESCE(SUM(pay.amount), 0) AS total_paid,
-            COALESCE(SUM(sp.total_cost), 0) - COALESCE(SUM(pay.amount), 0) AS balance_due
-        FROM suppliers s
-        LEFT JOIN supplier_purchases sp ON sp.supplier_id = s.id
-        LEFT JOIN supplier_payments pay ON pay.supplier_id = s.id
-        GROUP BY s.id
-        ORDER BY s.name ASC
+        SELECT 
+    s.*,
+    COALESCE(sp.total_purchased, 0) AS total_purchased,
+    COALESCE(pay.total_paid, 0) AS total_paid,
+    COALESCE(sp.total_purchased, 0) - COALESCE(pay.total_paid, 0) AS balance_due
+FROM suppliers s
+LEFT JOIN (
+    SELECT supplier_id, SUM(total_cost) AS total_purchased
+    FROM supplier_purchases
+    GROUP BY supplier_id
+) sp ON sp.supplier_id = s.id
+LEFT JOIN (
+    SELECT supplier_id, SUM(amount) AS total_paid
+    FROM supplier_payments
+    GROUP BY supplier_id
+) pay ON pay.supplier_id = s.id
+ORDER BY s.name ASC;
     """)
 
 
@@ -692,14 +848,21 @@ def get_supplier(supplier_id: int):
     # Summary stats
     stats = query("""
         SELECT
-            COALESCE(SUM(sp.total_cost), 0) AS total_purchased,
-            COALESCE(SUM(pay.amount), 0) AS total_paid,
-            COALESCE(SUM(sp.total_cost), 0) - COALESCE(SUM(pay.amount), 0) AS balance_due
-        FROM suppliers s
-        LEFT JOIN supplier_purchases sp ON sp.supplier_id = s.id
-        LEFT JOIN supplier_payments pay ON pay.supplier_id = s.id
-        WHERE s.id = %s
-        GROUP BY s.id
+    COALESCE(sp.total_purchased, 0) AS total_purchased,
+    COALESCE(pay.total_paid, 0) AS total_paid,
+    COALESCE(sp.total_purchased, 0) - COALESCE(pay.total_paid, 0) AS balance_due
+FROM suppliers s
+LEFT JOIN (
+    SELECT supplier_id, SUM(total_cost) AS total_purchased
+    FROM supplier_purchases
+    GROUP BY supplier_id
+) sp ON sp.supplier_id = s.id
+LEFT JOIN (
+    SELECT supplier_id, SUM(amount) AS total_paid
+    FROM supplier_payments
+    GROUP BY supplier_id
+) pay ON pay.supplier_id = s.id
+WHERE s.id = %s;
     """, (supplier_id,), fetchone=True)
 
     # Breakdown by item type
@@ -842,23 +1005,85 @@ def dashboard():
     }
 
 
+# @app.get("/analytics", status_code=200)
+# def analytics():
+#     # Revenue per month (last 12 months)
+#     monthly_revenue = query("""
+#         SELECT DATE_FORMAT(order_date, '%Y-%m') AS month,
+#                SUM(total_weight_kg * price_per_kg) AS revenue,
+#                SUM(total_weight_kg) AS weight_sold,
+#                COUNT(*) AS order_count
+#         FROM orders
+#         WHERE order_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+#         GROUP BY month
+#         ORDER BY month ASC
+#     """)
+
+#     # Top clients by weight this month
+#     top_clients_weight = query("""
+#         SELECT c.name, SUM(o.total_weight_kg) AS total_weight
+#         FROM orders o
+#         JOIN clients c ON c.id = o.client_id
+#         WHERE MONTH(o.order_date) = MONTH(CURDATE())
+#         AND YEAR(o.order_date) = YEAR(CURDATE())
+#         GROUP BY c.id
+#         ORDER BY total_weight DESC
+#         LIMIT 10
+#     """)
+
+#     # Top clients by revenue this month
+#     top_clients_revenue = query("""
+#         SELECT c.name, SUM(o.total_weight_kg * o.price_per_kg) AS total_revenue
+#         FROM orders o
+#         JOIN clients c ON c.id = o.client_id
+#         WHERE MONTH(o.order_date) = MONTH(CURDATE())
+#         AND YEAR(o.order_date) = YEAR(CURDATE())
+#         GROUP BY c.id
+#         ORDER BY total_revenue DESC
+#         LIMIT 10
+#     """)
+
+#     # Inventory summary
+#     inventory = query("""
+#         SELECT
+#             COALESCE(SUM(cy.total_weight_kg), 0) AS total_purchased,
+#             COALESCE(SUM(COALESCE(o_sum.distributed, 0)), 0) AS total_sold,
+#             COALESCE(SUM(cy.total_weight_kg) - SUM(COALESCE(o_sum.distributed, 0)), 0) AS current_stock
+#         FROM cycles cy
+#         LEFT JOIN (
+#             SELECT cycle_id, SUM(total_weight_kg) AS distributed
+#             FROM orders GROUP BY cycle_id
+#         ) o_sum ON o_sum.cycle_id = cy.id
+#     """, fetchone=True)
+
+#     return {
+#         "monthly_revenue": monthly_revenue,
+#         "top_clients_weight": top_clients_weight,
+#         "top_clients_revenue": top_clients_revenue,
+#         "inventory": inventory,
+#     }
+    
 @app.get("/analytics", status_code=200)
 def analytics():
     # Revenue per month (last 12 months)
     monthly_revenue = query("""
-        SELECT DATE_FORMAT(order_date, '%Y-%m') AS month,
+        SELECT DATE_FORMAT(order_date, '%Y-%m') AS month_key,
+               DATE_FORMAT(order_date, '%b %y') AS month,
                SUM(total_weight_kg * price_per_kg) AS revenue,
                SUM(total_weight_kg) AS weight_sold,
                COUNT(*) AS order_count
         FROM orders
         WHERE order_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
-        GROUP BY month
-        ORDER BY month ASC
+        GROUP BY month_key, month
+        ORDER BY month_key ASC
     """)
 
     # Top clients by weight this month
     top_clients_weight = query("""
-        SELECT c.name, SUM(o.total_weight_kg) AS total_weight
+        SELECT c.id, c.name,
+               SUM(o.total_weight_kg) AS total_weight,
+               SUM(o.total_weight_kg * o.price_per_kg) AS total_revenue,
+               COUNT(o.id) AS total_orders
         FROM orders o
         JOIN clients c ON c.id = o.client_id
         WHERE MONTH(o.order_date) = MONTH(CURDATE())
@@ -868,13 +1093,15 @@ def analytics():
         LIMIT 10
     """)
 
-    # Top clients by revenue this month
-    top_clients_revenue = query("""
-        SELECT c.name, SUM(o.total_weight_kg * o.price_per_kg) AS total_revenue
+    # Top clients all time
+    top_clients_alltime = query("""
+        SELECT c.id, c.name,
+               SUM(o.total_weight_kg) AS total_weight,
+               SUM(o.total_weight_kg * o.price_per_kg) AS total_revenue,
+               COUNT(o.id) AS total_orders,
+               MAX(o.order_date) AS last_order
         FROM orders o
         JOIN clients c ON c.id = o.client_id
-        WHERE MONTH(o.order_date) = MONTH(CURDATE())
-        AND YEAR(o.order_date) = YEAR(CURDATE())
         GROUP BY c.id
         ORDER BY total_revenue DESC
         LIMIT 10
@@ -885,7 +1112,8 @@ def analytics():
         SELECT
             COALESCE(SUM(cy.total_weight_kg), 0) AS total_purchased,
             COALESCE(SUM(COALESCE(o_sum.distributed, 0)), 0) AS total_sold,
-            COALESCE(SUM(cy.total_weight_kg) - SUM(COALESCE(o_sum.distributed, 0)), 0) AS current_stock
+            COALESCE(SUM(cy.total_weight_kg) - SUM(COALESCE(o_sum.distributed, 0)), 0) AS current_stock,
+            COALESCE(SUM(cy.total_weight_kg * cy.cost_per_kg), 0) AS total_cost
         FROM cycles cy
         LEFT JOIN (
             SELECT cycle_id, SUM(total_weight_kg) AS distributed
@@ -893,9 +1121,113 @@ def analytics():
         ) o_sum ON o_sum.cycle_id = cy.id
     """, fetchone=True)
 
+    # Revenue vs Cost per month (profit trend)
+    profit_trend = query("""
+        SELECT DATE_FORMAT(o.order_date, '%Y-%m') AS month_key,
+               DATE_FORMAT(o.order_date, '%b %y') AS month,
+               SUM(o.total_weight_kg * o.price_per_kg) AS revenue,
+               SUM(o.total_weight_kg * cy.cost_per_kg) AS cost
+        FROM orders o
+        JOIN cycles cy ON cy.id = o.cycle_id
+        WHERE o.order_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+        GROUP BY month_key, month
+        ORDER BY month_key ASC
+    """)
+
+    # Orders by status
+    order_status = query("""
+        SELECT status, COUNT(*) AS count,
+               SUM(total_weight_kg * price_per_kg) AS value
+        FROM orders
+        GROUP BY status
+    """)
+
+    # Average price per kg trend per month
+    price_trend = query("""
+        SELECT DATE_FORMAT(order_date, '%Y-%m') AS month_key,
+               DATE_FORMAT(order_date, '%b %y') AS month,
+               AVG(price_per_kg) AS avg_price,
+               AVG(total_weight_kg) AS avg_order_weight
+        FROM orders
+        WHERE order_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+        GROUP BY month_key, month
+        ORDER BY month_key ASC
+    """)
+
+    # Supplier cost breakdown
+    supplier_costs = query("""
+        SELECT COALESCE(s.name, 'No Supplier') AS supplier_name,
+               SUM(cy.total_weight_kg * cy.cost_per_kg) AS total_cost,
+               SUM(cy.total_weight_kg) AS total_weight,
+               COUNT(cy.id) AS total_cycles
+        FROM cycles cy
+        LEFT JOIN suppliers s ON s.id = cy.supplier_id
+        GROUP BY cy.supplier_id
+        ORDER BY total_cost DESC
+    """)
+
+    # Outstanding balances (clients who owe money)
+    outstanding = query("""
+        SELECT c.id, c.name,
+            SUM(o.total_weight_kg * o.price_per_kg) AS total_billed,
+            COALESCE(SUM(r.amount_paid), 0) + COALESCE(cp_sum.total_manual, 0) AS total_paid
+        FROM clients c
+        JOIN orders o ON o.client_id = c.id
+        LEFT JOIN receipts r ON r.order_id = o.id
+        LEFT JOIN (
+            SELECT client_id, SUM(amount) AS total_manual
+            FROM client_payments GROUP BY client_id
+        ) cp_sum ON cp_sum.client_id = c.id
+        GROUP BY c.id, cp_sum.total_manual
+        HAVING (total_billed - total_paid) > 0
+        ORDER BY (total_billed - total_paid) DESC
+        LIMIT 10
+    """)
+
+    # All time totals
+    totals = query("""
+        SELECT
+            COUNT(*) AS total_orders,
+            COALESCE(SUM(total_weight_kg), 0) AS total_weight,
+            COALESCE(SUM(total_weight_kg * price_per_kg), 0) AS total_revenue,
+            COALESCE(AVG(total_weight_kg), 0) AS avg_order_weight,
+            COALESCE(AVG(total_weight_kg * price_per_kg), 0) AS avg_order_value
+        FROM orders
+    """, fetchone=True)
+
+    # This month totals
+    this_month = query("""
+        SELECT
+            COUNT(*) AS orders,
+            COALESCE(SUM(total_weight_kg), 0) AS weight,
+            COALESCE(SUM(total_weight_kg * price_per_kg), 0) AS revenue
+        FROM orders
+        WHERE MONTH(order_date) = MONTH(CURDATE())
+        AND YEAR(order_date) = YEAR(CURDATE())
+    """, fetchone=True)
+
+    # Last month totals (for comparison)
+    last_month = query("""
+        SELECT
+            COUNT(*) AS orders,
+            COALESCE(SUM(total_weight_kg), 0) AS weight,
+            COALESCE(SUM(total_weight_kg * price_per_kg), 0) AS revenue
+        FROM orders
+        WHERE MONTH(order_date) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH))
+        AND YEAR(order_date) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH))
+    """, fetchone=True)
+
     return {
         "monthly_revenue": monthly_revenue,
         "top_clients_weight": top_clients_weight,
-        "top_clients_revenue": top_clients_revenue,
+        "top_clients_alltime": top_clients_alltime,
         "inventory": inventory,
+        "profit_trend": profit_trend,
+        "order_status": order_status,
+        "price_trend": price_trend,
+        "supplier_costs": supplier_costs,
+        "outstanding": outstanding,
+        "totals": totals,
+        "this_month": this_month,
+        "last_month": last_month,
     }
