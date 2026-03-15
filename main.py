@@ -34,6 +34,9 @@ class ResetPasswordRequest(BaseModel):
     current_password: str
     new_password: str
 
+class UpdateStatusRequest(BaseModel):
+    status: str
+    
 class SupplierRequest(BaseModel):
     name: str
     phone: Optional[str] = None
@@ -709,11 +712,11 @@ def create_order(body: OrderRequest):
 
 
 @app.put("/order/{order_id}/status", status_code=200)
-def update_order_status(order_id: int, status: str = Form(...)):
+def update_order_status(order_id: int, body: UpdateStatusRequest):
     order = query("SELECT * FROM orders WHERE id = %s", (order_id,), fetchone=True)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    query("UPDATE orders SET status = %s WHERE id = %s", (status, order_id))
+    query("UPDATE orders SET status = %s WHERE id = %s", (body.status, order_id))
     return {"message": "Order status updated"}
 
 
