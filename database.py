@@ -3,13 +3,40 @@ import re
 import sqlite3
 from datetime import datetime
 from fastapi import HTTPException
+from urllib.parse import urlparse, unquote
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DB_TYPE = os.getenv("DB_TYPE", "sqlite").lower()
+DATABASE_URL = os.getenv("DATABASE_URL")
 SQLITE_DB = os.getenv(
     "SQLITE_DB",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "alwajud.db"),
 )
 
+
+def _mysql_config():
+    if DATABASE_URL:
+        rest = DATABASE_URL.split("://", 1)[1]
+        creds, hostpart = rest.rsplit("@", 1)
+        user, password = creds.split(":", 1)
+        hostport, database = hostpart.split("/", 1)
+        host, _, port = hostport.partition(":")
+        return {
+            "host": host,
+            "port": int(port) if port else 3306,
+            "user": unquote(user),
+            "password": unquote(password),
+            "database": database.split("?")[0],
+        }
+    return {
+        "host": os.getenv("MYSQL_HOST", "localhost"),
+        "port": int(os.getenv("MYSQL_PORT", 3306)),
+        "user": os.getenv("MYSQL_USER", "root"),
+        "password": os.getenv("MYSQL_PASSWORD", ""),
+        "database": os.getenv("MYSQL_DATABASE", "alwajud_db"),
+    }
 
 # ── MySQL-compatible functions for SQLite ──────────────────────────
 def _parse(v):
@@ -56,7 +83,6 @@ def _sqlite_connect():
 def _sqlite_sql(sql: str) -> str:
     sql = sql.replace("%s", "?")
     sql = sql.replace("INT AUTO_INCREMENT PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
-    # INTERVAL syntax can't be a function, so translate it here
     sql = re.sub(
         r"DATE_SUB\(\s*CURDATE\(\)\s*,\s*INTERVAL\s+(\d+)\s+MONTH\s*\)",
         lambda m: f"date('now', '-{m.group(1)} months')",
@@ -70,12 +96,7 @@ def query(sql: str, params: tuple = (), fetchone: bool = False):
     try:
         if DB_TYPE == "mysql":
             import mysql.connector
-            conn = mysql.connector.connect(
-                host=os.getenv("MYSQL_HOST", "localhost"),
-                user=os.getenv("MYSQL_USER", "root"),
-                password=os.getenv("MYSQL_PASSWORD", ""),
-                database=os.getenv("MYSQL_DATABASE", "alwajud_db"),
-            )
+            conn = mysql.connector.connect(**_mysql_config())
             cursor = conn.cursor(dictionary=True)
             cursor.execute(sql, params)
             if sql.strip().upper().startswith("SELECT"):

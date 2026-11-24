@@ -6,7 +6,19 @@ from fastapi.staticfiles import StaticFiles
 from typing import Optional
 import os
 import uuid
-from PIL import Image
+import re
+from dotenv import load_dotenv
+import cloudinary
+import cloudinary.uploader
+
+load_dotenv()
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True,
+)
 
 app = FastAPI()
 
@@ -18,10 +30,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = "uploads/logos"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+def upload_logo(file: UploadFile) -> str:
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+    try:
+        result = cloudinary.uploader.upload(
+            file.file,
+            folder="alwajud/logos",
+            transformation=[{"width": 300, "height": 300, "crop": "limit"}],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Image upload failed: {e}")
+    return result["secure_url"]
 
+
+def delete_logo(url: Optional[str]):
+    """Best-effort delete of a Cloudinary image from its URL."""
+    if not url or "res.cloudinary.com" not in url:
+        return
+    m = re.search(r"/upload/(?:v\d+/)?(.+)\.[a-zA-Z0-9]+$", url)
+    if m:
+        try:
+            cloudinary.uploader.destroy(m.group(1))
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────
 # MODELS
@@ -127,19 +159,6 @@ def setup():
             FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
         )
     """)
-    
-    query("""
-    CREATE TABLE IF NOT EXISTS client_payments (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        client_id INT NOT NULL,
-        amount DECIMAL(10,2) NOT NULL,
-        payment_method VARCHAR(50),
-        payment_date DATE NOT NULL,
-        notes TEXT,
-        createdate DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (client_id) REFERENCES clients(id)
-    )
-""")
 
     query("""
         CREATE TABLE IF NOT EXISTS supplier_payments (
@@ -172,6 +191,19 @@ def setup():
             description VARCHAR(255),
             logo VARCHAR(255),
             createdate DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    query("""
+        CREATE TABLE IF NOT EXISTS client_payments (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            client_id INT NOT NULL,
+            amount DECIMAL(10,2) NOT NULL,
+            payment_method VARCHAR(50),
+            payment_date DATE NOT NULL,
+            notes TEXT,
+            createdate DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (client_id) REFERENCES clients(id)
         )
     """)
 
@@ -313,71 +345,6 @@ def get_clients():
         ORDER BY c.name ASC
     """)
 
-
-# @app.get("/clients/{client_id}", status_code=200)
-# def get_client(client_id: int):
-#     client = query("SELECT * FROM clients WHERE id = %s", (client_id,), fetchone=True)
-#     if not client:
-#         raise HTTPException(status_code=404, detail="Client not found")
-
-#     orders = query("""
-#         SELECT o.*, r.receipt_number
-#         FROM orders o
-#         LEFT JOIN receipts r ON r.order_id = o.id
-#         WHERE o.client_id = %s
-#         ORDER BY o.order_date DESC
-#     """, (client_id,))
-
-#     stats = query("""
-#         SELECT
-#             COALESCE(SUM(total_weight_kg), 0) AS total_weight,
-#             COALESCE(SUM(total_weight_kg * price_per_kg), 0) AS total_revenue,
-#             COUNT(*) AS total_orders
-#         FROM orders WHERE client_id = %s
-#     """, (client_id,), fetchone=True)
-
-#     return { **client, "orders": orders, "stats": stats }
-
-# @app.get("/clients/{client_id}", status_code=200)
-# def get_client(client_id: int):
-#     client = query("SELECT * FROM clients WHERE id = %s", (client_id,), fetchone=True)
-#     if not client:
-#         raise HTTPException(status_code=404, detail="Client not found")
-
-#     orders = query("""
-#         SELECT o.*, r.receipt_number
-#         FROM orders o
-#         LEFT JOIN receipts r ON r.order_id = o.id
-#         WHERE o.client_id = %s
-#         ORDER BY o.order_date DESC
-#     """, (client_id,))
-
-#     stats = query("""
-#         SELECT
-#             COALESCE(SUM(total_weight_kg), 0) AS total_weight,
-#             COALESCE(SUM(total_weight_kg * price_per_kg), 0) AS total_revenue,
-#             COUNT(*) AS total_orders
-#         FROM orders WHERE client_id = %s
-#     """, (client_id,), fetchone=True)
-
-#     payments = query(
-#         "SELECT * FROM client_payments WHERE client_id = %s ORDER BY payment_date DESC",
-#         (client_id,)
-#     )
-
-#     total_paid = query(
-#         "SELECT COALESCE(SUM(amount), 0) AS total_paid FROM client_payments WHERE client_id = %s",
-#         (client_id,), fetchone=True
-#     )
-
-#     return {
-#         **client,
-#         "orders": orders,
-#         "stats": stats,
-#         "payments": payments,
-#         "total_paid": total_paid["total_paid"]
-#     }
-
 @app.get("/clients/{client_id}", status_code=200)
 def get_client(client_id: int):
     client = query("SELECT * FROM clients WHERE id = %s", (client_id,), fetchone=True)
@@ -451,19 +418,11 @@ async def create_client(
     description: str = Form(None),
     logo: UploadFile = File(None),
 ):
-    logo_filename = None
-    if logo:
-        if not logo.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="File must be an image")
-        ext = logo.filename.split(".")[-1]
-        logo_filename = f"{uuid.uuid4()}.{ext}"
-        image = Image.open(logo.file)
-        image.thumbnail((300, 300))
-        image.save(os.path.join(UPLOAD_DIR, logo_filename))
+    logo_url = upload_logo(logo) if logo else None
 
     query(
         "INSERT INTO clients (name, phone, location, description, logo) VALUES (%s, %s, %s, %s, %s)",
-        (name, phone, location, description, logo_filename)
+        (name, phone, location, description, logo_url)
     )
     return {"message": "Client created"}
 
@@ -481,19 +440,15 @@ async def update_client(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    logo_filename = client["logo"]
+    logo_url = client["logo"]
     if logo:
-        if not logo.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="File must be an image")
-        ext = logo.filename.split(".")[-1]
-        logo_filename = f"{uuid.uuid4()}.{ext}"
-        image = Image.open(logo.file)
-        image.thumbnail((300, 300))
-        image.save(os.path.join(UPLOAD_DIR, logo_filename))
+        new_url = upload_logo(logo)
+        delete_logo(logo_url)   # remove the old image
+        logo_url = new_url
 
     query(
         "UPDATE clients SET name=%s, phone=%s, location=%s, description=%s, logo=%s WHERE id=%s",
-        (name, phone, location, description, logo_filename, client_id)
+        (name, phone, location, description, logo_url, client_id)
     )
     return {"message": "Client updated"}
 
@@ -504,6 +459,7 @@ def delete_client(client_id: int):
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
     query("DELETE FROM clients WHERE id = %s", (client_id,))
+    delete_logo(client["logo"])
     return {"message": "Client deleted"}
 
 

@@ -3,3 +3,5 @@ Uvicorn
 mysql-connector-python
 pillow 
 python-multipart
+python-dotenv
+cloudinary
